@@ -382,7 +382,6 @@ class ClipVesselLogic(ScriptedLoadableModuleLogic):
     # import the vmtk libraries
     try:
         import vtkvmtkComputationalGeometryPython as vtkvmtkComputationalGeometry
-        import vtkvmtkMiscPython as vtkvmtkMisc
     except ImportError:
         raise ImportError("VMTK library is not found")
 
@@ -486,7 +485,10 @@ class ClipVesselLogic(ScriptedLoadableModuleLogic):
     return edgeCenterPositions
 
   def clipModel(self, surface, centerlines, point, reverse):
+    """Clips the model at the given poin. Reverse flag indicates whether the clip
+     should be in the direction of the centerline tangent or not"""
     import vtkvmtkComputationalGeometryPython as vtkvmtkComputationalGeometry
+
     centerlineGeometry = vtkvmtkComputationalGeometry.vtkvmtkCenterlineGeometry()
     centerlineGeometry.SetInputData(centerlines)
     centerlineGeometry.SetLengthArrayName("Length")
@@ -508,30 +510,27 @@ class ClipVesselLogic(ScriptedLoadableModuleLogic):
     locator.BuildLocator()
     pointId = locator.FindClosestPoint(point)
     
-    # define plane normal to the splitCenterlines
-    #clipFunction = vtk.vtkPlanes() #need to define plane here
-    #clipFunction.SetNormals(centerlines.GetPointData().GetArray("FrenetNormal").GetTuple3(pointId))
-    #clipFunction.SetPoints(point)
-    #clipFunction.SetBounds() # create markups roi for each branch.
     if reverse:
         tangent = [val*-1 for val in centerlines.GetPointData().GetArray("FrenetTangent").GetTuple3(pointId)]
     else:
         tangent = centerlines.GetPointData().GetArray("FrenetTangent").GetTuple3(pointId)
     
+    # define plane normal to the centerlines
     clipFunctionPlane = vtk.vtkPlane()
     clipFunctionPlane.SetNormal(tangent)
     clipFunctionPlane.SetOrigin(point)
     
+    # define sphere at centerlines point
     clipFunctionSphere = vtk.vtkSphere()
     clipFunctionSphere.SetCenter(centerlines.GetPoint(pointId))
-    clipFunctionSphere.SetRadius(centerlines.GetPointData().GetArray("Radius").GetValue(pointId)*2.5)
-    
+    clipFunctionSphere.SetRadius(centerlines.GetPointData().GetArray("Radius").GetValue(pointId)*2)
+
+    # boolean merge the implicit plane and sphere so that the end result is a hemi-sphere
     clipFunctionCombined = vtk.vtkImplicitBoolean()
     clipFunctionCombined.AddFunction(clipFunctionPlane)
     clipFunctionCombined.AddFunction(clipFunctionSphere)
     clipFunctionCombined.SetOperationTypeToIntersection()
-    
-    
+       
     clipper = vtk.vtkClipPolyData()
     clipper.SetInputData(surface)
     clipper.GenerateClippedOutputOn()
@@ -539,6 +538,7 @@ class ClipVesselLogic(ScriptedLoadableModuleLogic):
     clipper.GenerateClipScalarsOff()
     clipper.SetValue(0.0)
     
+    # clip the surface with the hemi-sphere
     clipper.SetClipFunction(clipFunctionCombined)
         
     cutter = vtk.vtkCutter()
@@ -571,8 +571,6 @@ class ClipVesselLogic(ScriptedLoadableModuleLogic):
     stripper.SetInputData(cleaner.GetOutput())
     stripper.Update()
     cutLines = stripper.GetOutput()
-    #node=slicer.mrmlScene.AddNewNodeByClass("vtkMRMLModelNode", "clipped")
-    #node.SetAndObservePolyData(clippedSurface)
     
     return clippedSurface
     
@@ -599,6 +597,7 @@ class ClipVesselLogic(ScriptedLoadableModuleLogic):
     return branchClipper
 
   def resampleCenterline(self, polydata, spacing=0.5):
+    """Resamples centerline with a spline filter to a desired spacing"""
     splineFilter = vtk.vtkSplineFilter()
     splineFilter.SetInputData(polydata)
     splineFilter.SetSubdivideToLength()
@@ -609,18 +608,7 @@ class ClipVesselLogic(ScriptedLoadableModuleLogic):
         
   def extendVessel(self, surfacePolyData, centerlinesPolyData, extensionLength, extensionMode):
     """Adds flow extensions to all boundaries"""
-    # compute new centerlines for the truncated geometry
     
-    extensionRatio = 2
-    normalEstimationRatio = 1
-    adaptiveExtensionLength = 0
-    adaptiveExtensionRadius = 1
-    adaptiveNumberOfBoundaryPoints = 0
-    extensionRadius = 1
-    sigma = 1
-    transitionRatio = 0.25
-    targetNumberOfBoundaryPoints = 50
-    centerlineNormalEstimationRatio = 1.0
     extensionsFilter = vtkvmtkComputationalGeometry.vtkvmtkPolyDataFlowExtensionsFilter()
     extensionsFilter.SetInputData(surfacePolyData)
     extensionsFilter.SetCenterlines(centerlinesPolyData)
@@ -648,18 +636,24 @@ class ClipVesselLogic(ScriptedLoadableModuleLogic):
 
   def clipVessel(self, surfacePolyData, centerlinesNode, clipPointsMarkupsNode, cap, addFlowExtensions, extensionLength, extensionMode):
     """Clips the vessel.
-    :param surfacePolyData:
+    :param surfacePolyData: input surface
     :param centerlinesPolyData:
-    :param clipPointsMarkupsNode:
-    :param addFlowExtensions: adds flow extensions:
-    :return:
+    :param clipPointsMarkupsNode: markup node containing clip points
+    :param cap: flag indicating whether to cap the model:
+    :param addFlowExtensions: flag indicating whether to add flow extensions:
+    :param extensionLength: float value specifying the extension length:
+    :param extensionMode: string specifying the extension mode:
+    :return: polydata containing clipped vessel
     """
     
-    import vtkvmtkMiscPython as vtkvmtkMisc
     import vtkvmtkComputationalGeometryPython as vtkvmtkComputationalGeometry
 
     centerlinesPolyData = centerlinesNode.GetPolyData()
     centerlinesPolyData = self.resampleCenterline(centerlinesPolyData, spacing=0.5)
+
+    numberOfControlPoints = clipPointsMarkupsNode.GetNumberOfControlPoints()
+    if numberOfControlPoints == 0:
+        raise ValueError("Failed to clip vessel (no output was generated)")
 
     # identify closest point on centerline to clipPointsMarkups
     pointLocator = vtk.vtkPointLocator()
@@ -669,7 +663,6 @@ class ClipVesselLogic(ScriptedLoadableModuleLogic):
     clipPoints = []
     pos = [0.0, 0.0, 0.0]
     
-    numberOfControlPoints = clipPointsMarkupsNode.GetNumberOfControlPoints()
     for controlPointIndex in range(numberOfControlPoints):
         clipPointsMarkupsNode.GetNthControlPointPosition(controlPointIndex, pos)
         pointId = pointLocator.FindClosestPoint(pos)
@@ -690,7 +683,6 @@ class ClipVesselLogic(ScriptedLoadableModuleLogic):
     groupIds = vtk.vtkIdList()
     groupIds.InsertNextId(0)
 
-    # split the centerlines and clip the branch
     surface = surfacePolyData
     # clip with branchclipper (slightly off the clip point)
     # clip the stub with plane (clippolydata)
@@ -698,6 +690,8 @@ class ClipVesselLogic(ScriptedLoadableModuleLogic):
 
     for controlPointIndex in range(numberOfControlPoints):
         pointId = pointLocator.FindClosestPoint(clipPoints[controlPointIndex])
+        # set the centerline clipping point to be slightly off the clip point
+        # this is to to generate a stub which can be clipped and then merged with the main vessel
         if controlPointIndex == 0:
             splitPoint = centerlinesPolyData.GetPoint(pointId+1)
             reverse = True
@@ -705,13 +699,14 @@ class ClipVesselLogic(ScriptedLoadableModuleLogic):
             reverse = False
             splitPoint = centerlinesPolyData.GetPoint(pointId-1)    
 
-        pointSplitExtractor.SetSplitPoint(splitPoint) # crashing here
+        pointSplitExtractor.SetSplitPoint(splitPoint)
         pointSplitExtractor.Update()
         splitCenterlines = pointSplitExtractor.GetOutput()
         
+        # separate surface into groups based on the split centerlines
         branchClipper = self.set_clipper(surface, splitCenterlines, groupIds)
 
-        # if user provided points the inlet must be the first point
+        # create a stub and surface using the clipped centerlines
         if clipPointsMarkupsNode:
             if controlPointIndex == 0:
                 surface = branchClipper.GetClippedOutput()
@@ -721,8 +716,8 @@ class ClipVesselLogic(ScriptedLoadableModuleLogic):
                 stub = branchClipper.GetClippedOutput()  
         else:
             surface = branchClipper.GetOutput()
-        
-        # clip the stub
+
+        # clip the stub at the clipping point
         cutSegment = self.clipModel(stub, centerlinesPolyData, clipPoints[controlPointIndex], reverse)
         
         # merge stub and main vessel
@@ -734,19 +729,46 @@ class ClipVesselLogic(ScriptedLoadableModuleLogic):
         clean.SetInputData(append.GetOutput())
         clean.Update()
         surface = clean.GetOutput()
-        #temp=slicer.mrmlScene.AddNewNodeByClass("vtkMRMLModelNode", "temp1")
-        #temp.SetAndObservePolyData(surface)
 
-    if numberOfControlPoints == 0:
-        raise ValueError("Failed to clip vessel (no output was generated)")
+        # remove any disconnected pieces
+        connectFilter = vtk.vtkPolyDataConnectivityFilter()
+        connectFilter.SetInputData(surface)
+        connectFilter.SetExtractionModeToAllRegions()
+        connectFilter.ColorRegionsOn()
+        connectFilter.Update()
+        surface = connectFilter.GetOutput()
+
+        # if the centerline does not cover the entire surface 
+        # there may be pieces that are not connected. Identify and remove them.
+        num_regions = int(surface.GetPointData().GetArray("RegionId").GetRange()[1])
+
+        if num_regions > 0:
+            # find region closest to clip point
+            locator = vtk.vtkPointLocator()
+            locator.SetDataSet(surface)
+            locator.BuildLocator()
+            closestPointId = locator.FindClosestPoint(clipPoints[controlPointIndex])
+            region_id = surface.GetPointData().GetArray("RegionId").GetValue(closestPointId)
+
+            threshold = vtk.vtkThreshold()
+            threshold.SetInputData(surface)
+            threshold.SetInputArrayToProcess(0, 0, 0, "vtkDataObject::FIELD_ASSOCIATION_POINTS", "RegionId")
+            threshold.SetLowerThreshold(region_id)
+            threshold.SetUpperThreshold(region_id)
+            threshold.Update()
+            surface = threshold.GetOutput()
+
+            geoFilter = vtk.vtkGeometryFilter()
+            geoFilter.SetInputData(surface)
+            geoFilter.Update()
+            surface = geoFilter.GetOutput()
 
     if addFlowExtensions:
         slicer.util.showStatusMessage("Adding extensions...")
         slicer.app.processEvents() 
         surface = self.extendVessel(surface, centerlinesPolyData, extensionLength, extensionMode)
 
-    # Cap all the holes that are in the mesh that are not marked as endpoints
-    # Maybe this is not needed.
+    # Cap all the holes that are in the surface
     if cap:
         slicer.util.showStatusMessage("Capping surface...")
         slicer.app.processEvents() 
@@ -757,45 +779,6 @@ class ClipVesselLogic(ScriptedLoadableModuleLogic):
 
     logging.debug("End of Clip Vessel Computation..")
     return surfacePolyData
-
-  def decimateSurface(self, polyData):
-    '''
-    '''
-
-    decimationFilter = vtk.vtkDecimatePro()
-    decimationFilter.SetInputData(polyData)
-    decimationFilter.SetTargetReduction(0.99)
-    decimationFilter.SetBoundaryVertexDeletion(0)
-    decimationFilter.PreserveTopologyOn()
-    decimationFilter.Update()
-
-    cleaner = vtk.vtkCleanPolyData()
-    cleaner.SetInputData(decimationFilter.GetOutput())
-    cleaner.Update()
-
-    triangleFilter = vtk.vtkTriangleFilter()
-    triangleFilter.SetInputData(cleaner.GetOutput())
-    triangleFilter.Update()
-
-    outPolyData = vtk.vtkPolyData()
-    outPolyData.DeepCopy(triangleFilter.GetOutput())
-
-    return outPolyData
-        
-  def run(self):
-    self.resetCrossSections()
-    if not self.isInputCenterlineValid():
-        msg = "Input is invalid."
-        slicer.util.showStatusMessage(msg, 3000)
-        raise ValueError(msg)
-
-    logging.info('Processing started')
-    if self.outputTableNode:
-      self.emptyOutputTableNode()
-      self.updateOutputTable(self.inputCenterlineNode, self.outputTableNode)
-    if self.outputPlotSeriesNode:
-      self.updatePlot(self.outputPlotSeriesNode, self.outputTableNode, self.inputCenterlineNode.GetName())
-    logging.info('Processing completed')
 
 #
 # ClipVesselTest
